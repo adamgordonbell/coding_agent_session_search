@@ -2715,10 +2715,20 @@ pub fn run_index(
             }
             t_index = TantivyIndex::open_or_create(&index_path)?;
         } else {
+            let skip_watch_startup_scan = opts.watch
+                && !needs_rebuild
+                && !opts.full
+                && historical_salvage.messages_imported == 0
+                && storage.get_last_scan_ts().unwrap_or(None).is_some();
             if targeted_watch_once_only {
                 tracing::info!(
                     db_path = %opts.db_path.display(),
                     "skipping broad incremental scan because targeted watch-once paths were supplied"
+                );
+            } else if skip_watch_startup_scan {
+                tracing::info!(
+                    db_path = %opts.db_path.display(),
+                    "skipping broad startup scan because watch mode has an existing incremental watermark"
                 );
             } else {
                 let (lexical_strategy, lexical_strategy_reason) =
@@ -3400,14 +3410,30 @@ fn open_storage_for_index(
 ) -> Result<(FrankenStorage, bool, bool)> {
     if db_path.exists() {
         match current_schema_fast_probe(db_path) {
-            Ok(true) => match FrankenStorage::open(db_path) {
-                Ok(storage) => return Ok((storage, false, false)),
-                Err(err) => tracing::warn!(
-                    db_path = %db_path.display(),
-                    error = ?err,
-                    "fast current-schema storage open failed; falling back to compatibility recovery"
-                ),
-            },
+            Ok(true) => {
+                match FrankenStorage::open_writer(db_path) {
+                    Ok(storage) => {
+                        tracing::info!(
+                            db_path = %db_path.display(),
+                            "opened current-schema storage via writer fast path"
+                        );
+                        return Ok((storage, false, false));
+                    }
+                    Err(err) => tracing::warn!(
+                        db_path = %db_path.display(),
+                        error = ?err,
+                        "current-schema writer fast path failed; falling back to compatibility recovery"
+                    ),
+                }
+                match FrankenStorage::open(db_path) {
+                    Ok(storage) => return Ok((storage, false, false)),
+                    Err(err) => tracing::warn!(
+                        db_path = %db_path.display(),
+                        error = ?err,
+                        "fast current-schema storage open failed; falling back to compatibility recovery"
+                    ),
+                }
+            }
             Ok(false) => {}
             Err(err) => tracing::warn!(
                 db_path = %db_path.display(),
@@ -4477,9 +4503,6 @@ fn reindex_paths(
         );
 
         // SCAN PHASE: IO-heavy, no locks held
-        if explicit_watch_once {
-            tracing::warn!(?kind, scan_root = %root.path.display(), "watch_once_scan_begin");
-        }
         let mut convs = match conn.scan(&ctx) {
             Ok(c) => c,
             Err(e) => {
@@ -4506,27 +4529,12 @@ fn reindex_paths(
         }
 
         let conv_count = convs.len();
-        if explicit_watch_once {
-            tracing::warn!(
-                ?kind,
-                scan_root = %root.path.display(),
-                conversations = conv_count,
-                since_ts,
-                "watch_once_scan_done"
-            );
-        } else {
+        if !explicit_watch_once {
             tracing::info!(?kind, conversations = conv_count, since_ts, "watch_scan");
         }
 
         // INGEST PHASE: Acquire locks briefly
         {
-            if explicit_watch_once {
-                tracing::warn!(
-                    ?kind,
-                    conversations = conv_count,
-                    "watch_once_ingest_begin"
-                );
-            }
             let storage = storage
                 .lock()
                 .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?;
@@ -4553,13 +4561,6 @@ fn reindex_paths(
                 "updating watch last_indexed_at",
                 |writer| writer.set_last_indexed_at(FrankenStorage::now_millis()),
             )?;
-            if explicit_watch_once {
-                tracing::warn!(
-                    ?kind,
-                    conversations = conv_count,
-                    "watch_once_ingest_done"
-                );
-            }
         }
 
         // Track total indexed for stale detection
