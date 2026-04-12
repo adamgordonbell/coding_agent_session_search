@@ -3,7 +3,7 @@ pub mod refresh_ledger;
 pub mod semantic;
 
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Seek, Write};
 use std::path::{Path, PathBuf};
@@ -2367,6 +2367,34 @@ pub fn run_index(
     persist::apply_index_writer_busy_timeout(&storage);
     persist::apply_index_writer_checkpoint_policy(&storage, defer_checkpoints);
     let index_path = index_dir(&opts.data_dir)?;
+    if let Some(paths) = opts
+        .watch_once_paths
+        .clone()
+        .filter(|paths| !paths.is_empty())
+        && !opts.watch
+        && !opts.full
+    {
+        let t_index = TantivyIndex::open_or_create(&index_path)?;
+        let state = Mutex::new(load_watch_state(&opts.data_dir));
+        let storage = Mutex::new(storage);
+        let t_index = Mutex::new(t_index);
+        let stale_detector = StaleDetector::from_env();
+        let roots = build_explicit_watch_once_roots(&paths);
+
+        let indexed = finalize_watch_once_reindex_result(
+            reindex_paths(&opts, paths, &roots, &state, &storage, &t_index, false),
+            &stale_detector,
+            opts.progress.as_ref(),
+            "watch_once",
+        )?;
+
+        tracing::info!(
+            indexed,
+            "explicit watch-once reindex completed via early fast path"
+        );
+        reset_progress_to_idle(opts.progress.as_ref());
+        return Ok(());
+    }
     let mut initial_canonical_sessions_before_salvage = count_total_conversations_exact(&storage)?;
     if opts.full
         && !opened_fresh_for_full
@@ -4074,6 +4102,30 @@ fn build_watch_roots(additional_scan_roots: Vec<ScanRoot>) -> Vec<(ConnectorKind
     roots
 }
 
+fn build_explicit_watch_once_roots(paths: &[PathBuf]) -> Vec<(ConnectorKind, ScanRoot)> {
+    let all_kinds: Vec<ConnectorKind> = get_connector_factories()
+        .into_iter()
+        .filter_map(|(name, _)| ConnectorKind::from_slug(name))
+        .collect();
+    let mut roots = Vec::new();
+    let mut seen = HashSet::new();
+
+    for path in paths {
+        let kinds: Vec<ConnectorKind> = explicit_watch_once_connector_hint(path)
+            .map(|kind| vec![kind])
+            .unwrap_or_else(|| all_kinds.clone());
+
+        for kind in kinds {
+            let key = (kind, path.clone());
+            if seen.insert(key) {
+                roots.push((kind, ScanRoot::local(path.clone())));
+            }
+        }
+    }
+
+    roots
+}
+
 impl ConnectorKind {
     fn from_slug(slug: &str) -> Option<Self> {
         match slug {
@@ -4425,6 +4477,9 @@ fn reindex_paths(
         );
 
         // SCAN PHASE: IO-heavy, no locks held
+        if explicit_watch_once {
+            tracing::warn!(?kind, scan_root = %root.path.display(), "watch_once_scan_begin");
+        }
         let mut convs = match conn.scan(&ctx) {
             Ok(c) => c,
             Err(e) => {
@@ -4457,7 +4512,7 @@ fn reindex_paths(
                 scan_root = %root.path.display(),
                 conversations = conv_count,
                 since_ts,
-                "watch_once_scan"
+                "watch_once_scan_done"
             );
         } else {
             tracing::info!(?kind, conversations = conv_count, since_ts, "watch_scan");
@@ -4465,6 +4520,13 @@ fn reindex_paths(
 
         // INGEST PHASE: Acquire locks briefly
         {
+            if explicit_watch_once {
+                tracing::warn!(
+                    ?kind,
+                    conversations = conv_count,
+                    "watch_once_ingest_begin"
+                );
+            }
             let storage = storage
                 .lock()
                 .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?;
@@ -4491,6 +4553,13 @@ fn reindex_paths(
                 "updating watch last_indexed_at",
                 |writer| writer.set_last_indexed_at(FrankenStorage::now_millis()),
             )?;
+            if explicit_watch_once {
+                tracing::warn!(
+                    ?kind,
+                    conversations = conv_count,
+                    "watch_once_ingest_done"
+                );
+            }
         }
 
         // Track total indexed for stale detection
