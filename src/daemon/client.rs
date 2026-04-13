@@ -22,7 +22,9 @@ use super::protocol::{
     decode_message, default_socket_path, encode_message,
 };
 use super::worker::EmbeddingJobConfig;
+use crate::search::ann_index::AnnSearchStats;
 use crate::search::daemon_client::{DaemonClient, DaemonError};
+use crate::search::vector_index::{SemanticFilter, VectorSearchResult};
 
 /// Configuration for the daemon client.
 #[derive(Debug, Clone)]
@@ -471,6 +473,30 @@ impl UdsDaemonClient {
         })?;
         match response {
             Response::JobCancelled { cancelled, .. } => Ok(cancelled),
+            other => Err(DaemonError::Failed(format!(
+                "unexpected response: {:?}",
+                other
+            ))),
+        }
+    }
+
+    pub fn semantic_search_approx(
+        &self,
+        vector_index_path: &str,
+        ann_path: &str,
+        embedding: Vec<f32>,
+        fetch_limit: usize,
+        filter: SemanticFilter,
+    ) -> Result<(Vec<VectorSearchResult>, Option<AnnSearchStats>), DaemonError> {
+        let response = self.send_request(Request::SemanticSearchApprox {
+            vector_index_path: vector_index_path.to_string(),
+            ann_path: ann_path.to_string(),
+            embedding,
+            fetch_limit,
+            filter,
+        })?;
+        match response {
+            Response::SemanticSearchApprox(result) => Ok((result.results, result.ann_stats)),
             other => Err(DaemonError::Failed(format!(
                 "unexpected response: {:?}",
                 other

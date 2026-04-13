@@ -12,6 +12,7 @@ use anyhow::{Result, anyhow};
 use frankensqlite::Connection as FrankenConnection;
 use frankensqlite::compat::{ConnectionExt, RowExt};
 use half::f16;
+use serde::{Deserialize, Serialize};
 
 pub use frankensearch::index::{Quantization, SearchParams, VectorIndex, VectorIndexWriter};
 
@@ -164,7 +165,7 @@ fn source_id_hash(source_id: &str) -> u32 {
 }
 
 /// Semantic filter constraints expressed in numeric IDs for fast evaluation.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SemanticFilter {
     pub agents: Option<HashSet<u32>>,
     pub workspaces: Option<HashSet<u32>>,
@@ -314,7 +315,7 @@ impl SemanticFilterMaps {
 }
 
 /// Collapsed semantic search hit (best chunk per message).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VectorSearchResult {
     pub message_id: u64,
     pub chunk_idx: u8,

@@ -6891,6 +6891,10 @@ fn run_cli_search(
                         retryable: false,
                     });
                 }
+                #[cfg(unix)]
+                if let Ok(daemon) = crate::daemon::client::connect_or_spawn() {
+                    let _ = client.set_semantic_daemon(daemon);
+                }
             } else {
                 let _ = client.clear_semantic_context();
                 return Err(CliError {
@@ -6970,6 +6974,12 @@ fn run_cli_search(
                     hint: Some(hint),
                     retryable: false,
                 });
+            }
+            #[cfg(unix)]
+            if semantic_opts.use_daemon
+                && let Ok(daemon) = crate::daemon::client::connect_or_spawn()
+            {
+                let _ = client.set_semantic_daemon(daemon);
             }
             } else {
                 let _ = client.clear_semantic_context();

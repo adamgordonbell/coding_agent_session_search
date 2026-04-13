@@ -7,6 +7,9 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::search::ann_index::AnnSearchStats;
+use crate::search::vector_index::{SemanticFilter, VectorSearchResult};
+
 /// Protocol version for compatibility checks.
 /// Both cass and xf must use the same version to share a daemon.
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -48,6 +51,15 @@ pub enum Request {
         model: String,
     },
 
+    /// Execute approximate semantic search against a cached vector/HNSW pair.
+    SemanticSearchApprox {
+        vector_index_path: String,
+        ann_path: String,
+        embedding: Vec<f32>,
+        fetch_limit: usize,
+        filter: SemanticFilter,
+    },
+
     /// Get daemon status and loaded models.
     Status,
 
@@ -84,6 +96,9 @@ pub enum Response {
 
     /// Rerank response with scores.
     Rerank(RerankResponse),
+
+    /// Approximate semantic search response.
+    SemanticSearchApprox(SemanticSearchResponse),
 
     /// Status response with daemon info.
     Status(StatusResponse),
@@ -135,6 +150,17 @@ pub struct RerankResponse {
     pub scores: Vec<f32>,
     /// Model ID used.
     pub model: String,
+    /// Processing time in milliseconds.
+    pub elapsed_ms: u64,
+}
+
+/// Response containing approximate semantic search results.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SemanticSearchResponse {
+    /// Collapsed semantic hits.
+    pub results: Vec<VectorSearchResult>,
+    /// ANN search statistics.
+    pub ann_stats: Option<AnnSearchStats>,
     /// Processing time in milliseconds.
     pub elapsed_ms: u64,
 }

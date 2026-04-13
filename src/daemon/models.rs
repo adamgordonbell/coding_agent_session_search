@@ -3,17 +3,36 @@
 //! This module provides lazy-loaded access to embedding and reranking models,
 //! supporting graceful fallback when models are unavailable.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use anyhow::{Context, Result, bail};
+use frankensearch::core::filter::SearchFilter as FsSearchFilter;
+use frankensearch::index::{
+    HNSW_DEFAULT_EF_SEARCH as FS_HNSW_DEFAULT_EF_SEARCH, HnswIndex as FsHnswIndex,
+    VectorIndex as FsVectorIndex,
+};
 use parking_lot::RwLock;
 use tracing::{info, warn};
 
+use crate::search::ann_index::AnnSearchStats;
 use crate::search::embedder::{Embedder, EmbedderError, EmbedderResult};
 use crate::search::fastembed_embedder::FastEmbedder;
 use crate::search::fastembed_reranker::FastEmbedReranker;
 use crate::search::hash_embedder::HashEmbedder;
 use crate::search::reranker::{Reranker, RerankerError, RerankerResult, rerank_texts};
+use crate::search::vector_index::{
+    SemanticFilter, VectorSearchResult, parse_semantic_doc_id, vector_index_path,
+};
+use crate::search::ann_index::hnsw_index_path;
+
+const ANN_CANDIDATE_MULTIPLIER: usize = 4;
+
+struct SemanticIndexPair {
+    vector_index: Arc<FsVectorIndex>,
+    ann_index: Arc<FsHnswIndex>,
+}
 
 /// Model manager that handles lazy loading of embedder and reranker models.
 pub struct ModelManager {
@@ -23,6 +42,7 @@ pub struct ModelManager {
     embedder_name: RwLock<String>,
     reranker_name: RwLock<String>,
     fallback_embedder: Arc<HashEmbedder>,
+    semantic_indices: RwLock<HashMap<(PathBuf, PathBuf), Arc<SemanticIndexPair>>>,
 }
 
 impl ModelManager {
@@ -35,6 +55,7 @@ impl ModelManager {
             embedder_name: RwLock::new("not-loaded".to_string()),
             reranker_name: RwLock::new("not-loaded".to_string()),
             fallback_embedder: Arc::new(HashEmbedder::new(384)),
+            semantic_indices: RwLock::new(HashMap::new()),
         }
     }
 
@@ -213,12 +234,137 @@ impl ModelManager {
         rerank_texts(&**reranker, query, &doc_refs)
     }
 
+    fn cached_semantic_pair(
+        &self,
+        vector_index_path: &Path,
+        ann_path: &Path,
+    ) -> Result<Arc<SemanticIndexPair>> {
+        let key = (vector_index_path.to_path_buf(), ann_path.to_path_buf());
+        let mut guard = self.semantic_indices.write();
+        if let Some(existing) = guard.get(&key).cloned() {
+            return Ok(existing);
+        }
+
+        let vector_index = Arc::new(FsVectorIndex::open(vector_index_path).with_context(|| {
+            format!(
+                "open semantic vector index failed: {}",
+                vector_index_path.display()
+            )
+        })?);
+        if !ann_path.is_file() {
+            bail!("HNSW index not found at {}", ann_path.display());
+        }
+        let ann_index = Arc::new(
+            FsHnswIndex::load(ann_path, vector_index.as_ref())
+                .map_err(|err| anyhow::anyhow!("open HNSW index failed: {err}"))?,
+        );
+        let matches = ann_index
+            .matches_vector_index(vector_index.as_ref())
+            .map_err(|err| anyhow::anyhow!("validate HNSW index failed: {err}"))?;
+        if !matches {
+            bail!(
+                "HNSW index at {} is stale for current semantic index",
+                ann_path.display()
+            );
+        }
+
+        let pair = Arc::new(SemanticIndexPair {
+            vector_index,
+            ann_index,
+        });
+        guard.insert(key, Arc::clone(&pair));
+        Ok(pair)
+    }
+
+    pub fn warm_semantic_assets(&self) -> Result<()> {
+        let embedder_id = self.embedder_id();
+        let vector_path = vector_index_path(&self.data_dir, &embedder_id);
+        let ann_path = hnsw_index_path(&self.data_dir, &embedder_id);
+        if !vector_path.is_file() || !ann_path.is_file() {
+            bail!(
+                "semantic assets missing for {} (expected {}, {})",
+                embedder_id,
+                vector_path.display(),
+                ann_path.display()
+            );
+        }
+        let _ = self.cached_semantic_pair(&vector_path, &ann_path)?;
+        Ok(())
+    }
+
+    pub fn semantic_search_approx(
+        &self,
+        vector_index_path: &Path,
+        ann_path: &Path,
+        embedding: &[f32],
+        fetch_limit: usize,
+        filter: &SemanticFilter,
+    ) -> Result<(Vec<VectorSearchResult>, AnnSearchStats)> {
+        let pair = self.cached_semantic_pair(vector_index_path, ann_path)?;
+        let candidate = fetch_limit
+            .saturating_mul(ANN_CANDIDATE_MULTIPLIER)
+            .max(fetch_limit);
+        let ef = FS_HNSW_DEFAULT_EF_SEARCH.max(candidate);
+        let (ann_results, search_stats) = pair
+            .ann_index
+            .knn_search_with_stats(embedding, candidate, ef)
+            .map_err(|err| anyhow::anyhow!("frankensearch approximate search failed: {err}"))?;
+
+        let mut best_by_message: HashMap<u64, VectorSearchResult> = HashMap::new();
+        for hit in ann_results {
+            if !filter.is_unrestricted() && !filter.matches(&hit.doc_id, None) {
+                continue;
+            }
+            let Some(parsed) = parse_semantic_doc_id(&hit.doc_id) else {
+                continue;
+            };
+            best_by_message
+                .entry(parsed.message_id)
+                .and_modify(|entry| {
+                    if hit.score > entry.score {
+                        entry.score = hit.score;
+                        entry.chunk_idx = parsed.chunk_idx;
+                    }
+                })
+                .or_insert(VectorSearchResult {
+                    message_id: parsed.message_id,
+                    chunk_idx: parsed.chunk_idx,
+                    score: hit.score,
+                });
+        }
+
+        let mut results: Vec<VectorSearchResult> = best_by_message.into_values().collect();
+        results.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| a.message_id.cmp(&b.message_id))
+        });
+        if results.len() > fetch_limit {
+            results.truncate(fetch_limit);
+        }
+
+        Ok((
+            results,
+            AnnSearchStats {
+                index_size: search_stats.index_size,
+                dimension: search_stats.dimension,
+                ef_search: search_stats.ef_search,
+                k_requested: search_stats.k_requested,
+                k_returned: search_stats.k_returned,
+                search_time_us: search_stats.search_time_us,
+                estimated_recall: search_stats.estimated_recall as f32,
+                is_approximate: search_stats.is_approximate,
+            },
+        ))
+    }
+
     /// Unload all models to free memory.
     pub fn unload_all(&self) {
         *self.embedder.write() = None;
         *self.reranker.write() = None;
         *self.embedder_name.write() = "not-loaded".to_string();
         *self.reranker_name.write() = "not-loaded".to_string();
+        self.semantic_indices.write().clear();
         info!("All models unloaded");
     }
 }

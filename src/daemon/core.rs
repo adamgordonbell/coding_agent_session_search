@@ -18,8 +18,8 @@ use super::daemon_run_lock_path;
 use super::models::ModelManager;
 use super::protocol::{
     EmbedResponse, EmbeddingJobDetail, EmbeddingJobInfo, ErrorCode, ErrorResponse, FramedMessage,
-    HealthStatus, ModelInfo, PROTOCOL_VERSION, Request, RerankResponse, Response, StatusResponse,
-    decode_message, default_socket_path, encode_message,
+    HealthStatus, ModelInfo, PROTOCOL_VERSION, Request, RerankResponse, Response,
+    SemanticSearchResponse, StatusResponse, decode_message, default_socket_path, encode_message,
 };
 use super::resource::ResourceMonitor;
 use super::worker::{EmbeddingJobConfig, EmbeddingWorker, EmbeddingWorkerHandle};
@@ -266,6 +266,11 @@ impl ModelDaemon {
         if let Err(e) = self.models.warm_reranker() {
             warn!(error = %e, "Failed to pre-warm reranker");
         }
+        if let Err(e) = self.models.warm_semantic_assets() {
+            warn!(error = %e, "Failed to pre-warm semantic ANN assets");
+        } else {
+            info!("Semantic ANN assets pre-warmed");
+        }
         info!("Model pre-warming complete");
 
         // Start background embedding worker
@@ -479,6 +484,44 @@ impl ModelDaemon {
                         message: e.to_string(),
                         retryable: true,
                         retry_after_ms: Some(1000),
+                    }),
+                }
+            }
+
+            Request::SemanticSearchApprox {
+                vector_index_path,
+                ann_path,
+                embedding,
+                fetch_limit,
+                filter,
+            } => {
+                debug!(
+                    request_id = %request_id,
+                    vector_index_path,
+                    ann_path,
+                    fetch_limit,
+                    "Processing approximate semantic search request"
+                );
+
+                match self.models.semantic_search_approx(
+                    std::path::Path::new(&vector_index_path),
+                    std::path::Path::new(&ann_path),
+                    &embedding,
+                    fetch_limit,
+                    &filter,
+                ) {
+                    Ok((results, ann_stats)) => Response::SemanticSearchApprox(
+                        SemanticSearchResponse {
+                            results,
+                            ann_stats: Some(ann_stats),
+                            elapsed_ms: start.elapsed().as_millis() as u64,
+                        },
+                    ),
+                    Err(e) => Response::Error(ErrorResponse {
+                        code: ErrorCode::Internal,
+                        message: e.to_string(),
+                        retryable: true,
+                        retry_after_ms: Some(250),
                     }),
                 }
             }

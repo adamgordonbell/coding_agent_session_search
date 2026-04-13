@@ -1668,11 +1668,23 @@ fn open_fs_semantic_ann_index(fs_index: &FsVectorIndex, ann_path: &Path) -> Resu
         );
     }
 
+    let load_start = Instant::now();
     let ann = FsHnswIndex::load(ann_path, fs_index)
         .map_err(|err| anyhow!("open HNSW index failed: {err}"))?;
+    let load_elapsed = load_start.elapsed();
+
+    let validate_start = Instant::now();
     let matches = ann
         .matches_vector_index(fs_index)
         .map_err(|err| anyhow!("validate HNSW index failed: {err}"))?;
+    let validate_elapsed = validate_start.elapsed();
+    tracing::info!(
+        path = %ann_path.display(),
+        load_ms = load_elapsed.as_millis(),
+        validate_ms = validate_elapsed.as_millis(),
+        vector_count = fs_index.record_count(),
+        "semantic HNSW open timings"
+    );
     if !matches {
         bail!(
             "approximate search unavailable: HNSW index at {} is stale for current semantic index (run 'cass index --semantic --build-hnsw')",
@@ -1689,6 +1701,8 @@ struct SemanticSearchState {
     fs_semantic_index: Arc<FsVectorIndex>,
     fs_ann_index: Option<Arc<FsHnswIndex>>,
     ann_path: Option<PathBuf>,
+    #[cfg(unix)]
+    semantic_daemon: Option<Arc<crate::daemon::client::UdsDaemonClient>>,
     fs_in_memory_two_tier_index: Option<Arc<FsInMemoryTwoTierIndex>>,
     in_memory_two_tier_unavailable: InMemoryTwoTierUnavailable,
     progressive_context: Option<Arc<ProgressiveTwoTierContext>>,
@@ -3013,6 +3027,8 @@ impl SearchClient {
             fs_semantic_index: Arc::new(fs_semantic_index),
             fs_ann_index: None,
             ann_path,
+            #[cfg(unix)]
+            semantic_daemon: None,
             fs_in_memory_two_tier_index: None,
             in_memory_two_tier_unavailable: InMemoryTwoTierUnavailable::default(),
             progressive_context: None,
@@ -3021,6 +3037,22 @@ impl SearchClient {
             roles,
             query_cache: QueryCache::new(embedder_id.as_str(), capacity),
         });
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    pub fn set_semantic_daemon(
+        &self,
+        daemon: Arc<crate::daemon::client::UdsDaemonClient>,
+    ) -> Result<()> {
+        let mut guard = self
+            .semantic
+            .lock()
+            .map_err(|_| anyhow!("semantic lock poisoned"))?;
+        let state = guard
+            .as_mut()
+            .ok_or_else(|| anyhow!("semantic search unavailable (no semantic context)"))?;
+        state.semantic_daemon = Some(daemon);
         Ok(())
     }
 
@@ -3099,6 +3131,18 @@ impl SearchClient {
                 vector: embedding,
             });
         }
+    }
+
+    #[cfg(unix)]
+    fn has_semantic_daemon(&self) -> Result<bool> {
+        let guard = self
+            .semantic
+            .lock()
+            .map_err(|_| anyhow!("semantic lock poisoned"))?;
+        Ok(guard
+            .as_ref()
+            .and_then(|state| state.semantic_daemon.as_ref())
+            .is_some())
     }
 
     fn in_memory_two_tier_index(
@@ -3343,6 +3387,13 @@ impl SearchClient {
                 );
             }
 
+            #[cfg(unix)]
+            if let Some((results, search_was_truncated, ann_stats)) =
+                self.search_semantic_candidates_via_daemon(embedding, &semantic_filter, &request)?
+            {
+                return Ok((results, search_was_truncated, ann_stats));
+            }
+
             let ann = request
                 .ann_index
                 .ok_or_else(|| anyhow!("HNSW index failed to initialize"))?;
@@ -3430,6 +3481,56 @@ impl SearchClient {
             fs_hits.len() >= request.fetch_limit,
             None,
         ))
+    }
+
+    #[cfg(unix)]
+    fn search_semantic_candidates_via_daemon(
+        &self,
+        embedding: &[f32],
+        semantic_filter: &SemanticFilter,
+        request: &SemanticCandidateSearchRequest<'_>,
+    ) -> Result<Option<(
+        Vec<VectorSearchResult>,
+        bool,
+        Option<crate::search::ann_index::AnnSearchStats>,
+    )>> {
+        let (daemon, ann_path, embedder_id) = {
+            let guard = self
+                .semantic
+                .lock()
+                .map_err(|_| anyhow!("semantic lock poisoned"))?;
+            let state = guard.as_ref().ok_or_else(|| {
+                anyhow!("semantic search unavailable (no embedder or vector index)")
+            })?;
+            (
+                state.semantic_daemon.clone(),
+                state.ann_path.clone(),
+                state.embedder.id().to_string(),
+            )
+        };
+
+        let Some(daemon) = daemon else {
+            return Ok(None);
+        };
+        let Some(ann_path) = ann_path else {
+            return Ok(None);
+        };
+        let vector_index_path = ann_path
+            .parent()
+            .map(|parent| parent.join(format!("index-{embedder_id}.fsvi")))
+            .ok_or_else(|| anyhow!("semantic search unavailable (invalid ANN path)"))?;
+
+        let (results, ann_stats) = daemon
+            .semantic_search_approx(
+                &vector_index_path.to_string_lossy(),
+                &ann_path.to_string_lossy(),
+                embedding.to_vec(),
+                request.fetch_limit,
+                semantic_filter.clone(),
+            )
+            .map_err(|err| anyhow!("daemon semantic search failed: {err}"))?;
+        let truncated = results.len() >= request.fetch_limit;
+        Ok(Some((results, truncated, ann_stats)))
     }
 
     pub fn can_progressively_refine(&self) -> bool {
@@ -4370,6 +4471,7 @@ impl SearchClient {
         Vec<SearchHit>,
         Option<crate::search::ann_index::AnnSearchStats>,
     )> {
+        let overall_start = Instant::now();
         let field_mask = effective_field_mask(field_mask);
         let canonical = canonicalize_for_embedding(query);
         if canonical.trim().is_empty() {
@@ -4387,8 +4489,15 @@ impl SearchClient {
         let initial_fetch_limit = target_hits;
         let fallback_fetch_limit = target_hits.saturating_mul(3);
         loop {
+            let mut embedding_elapsed = Duration::default();
+            let mut context_elapsed = Duration::default();
+            let mut ann_init_elapsed = Duration::default();
+            let setup_start = Instant::now();
             let (embedding, candidate_context, in_memory_two_tier_index, ann_index, context_token) = loop {
+                let embedding_start = Instant::now();
                 let embedding = self.semantic_query_embedding(&canonical)?;
+                embedding_elapsed = embedding_start.elapsed();
+                let context_start = Instant::now();
                 let (candidate_context, context_token) = {
                     let guard = self
                         .semantic
@@ -4406,19 +4515,33 @@ impl SearchClient {
                         Arc::clone(&state.context_token),
                     )
                 };
+                context_elapsed = context_start.elapsed();
                 if !Arc::ptr_eq(&embedding.context_token, &context_token) {
                     continue;
                 }
+                let ann_start = Instant::now();
                 let in_memory_two_tier_index = if tier_mode.wants_two_tier() && !approximate {
                     self.in_memory_two_tier_index(tier_mode)?
                 } else {
                     None
                 };
                 let ann_index = if approximate {
-                    Some(self.ann_index()?)
+                    #[cfg(unix)]
+                    {
+                        if self.has_semantic_daemon()? {
+                            None
+                        } else {
+                            Some(self.ann_index()?)
+                        }
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        Some(self.ann_index()?)
+                    }
                 } else {
                     None
                 };
+                ann_init_elapsed = ann_start.elapsed();
 
                 let guard = self
                     .semantic
@@ -4438,6 +4561,17 @@ impl SearchClient {
                     context_token,
                 );
             };
+            let setup_elapsed = setup_start.elapsed();
+            tracing::info!(
+                query = canonical,
+                embedding_ms = embedding_elapsed.as_millis(),
+                context_ms = context_elapsed.as_millis(),
+                ann_init_ms = ann_init_elapsed.as_millis(),
+                setup_ms = setup_elapsed.as_millis(),
+                approximate,
+                tier_mode = ?tier_mode,
+                "semantic search setup timings"
+            );
 
             let finalize_hits =
                 |results: &[VectorSearchResult]| -> Result<(usize, Vec<SearchHit>)> {
@@ -4445,6 +4579,7 @@ impl SearchClient {
                     Ok(self.postprocess_hits_page(hits, query, &filters, limit, offset))
                 };
 
+            let candidate_start = Instant::now();
             let (results, search_was_truncated, mut ann_stats) = self.search_semantic_candidates(
                 &candidate_context,
                 &embedding,
@@ -4457,11 +4592,32 @@ impl SearchClient {
                     ann_index: ann_index.as_ref(),
                 },
             )?;
+            let candidate_elapsed = candidate_start.elapsed();
+            tracing::info!(
+                query = canonical,
+                candidate_ms = candidate_elapsed.as_millis(),
+                candidate_count = results.len(),
+                search_was_truncated,
+                approximate,
+                tier_mode = ?tier_mode,
+                "semantic candidate search timings"
+            );
             if !self.semantic_context_matches(&context_token)? {
                 tracing::debug!("semantic context changed during candidate search; retrying");
                 continue;
             }
+            let finalize_start = Instant::now();
             let (mut available_hits, mut paged_hits) = finalize_hits(&results)?;
+            let mut finalize_elapsed = finalize_start.elapsed();
+            tracing::info!(
+                query = canonical,
+                finalize_ms = finalize_elapsed.as_millis(),
+                available_hits,
+                returned = paged_hits.len(),
+                approximate,
+                tier_mode = ?tier_mode,
+                "semantic finalize timings"
+            );
 
             let needs_retry = available_hits < target_hits
                 && search_was_truncated
@@ -4476,6 +4632,7 @@ impl SearchClient {
                     fallback_fetch_limit,
                     "retrying semantic fetch due to post-filter shortfall"
                 );
+                let retry_candidate_start = Instant::now();
                 let (retry_results, _, retry_ann_stats) = self.search_semantic_candidates(
                     &candidate_context,
                     &embedding,
@@ -4488,12 +4645,43 @@ impl SearchClient {
                         ann_index: ann_index.as_ref(),
                     },
                 )?;
+                let retry_candidate_elapsed = retry_candidate_start.elapsed();
                 if !self.semantic_context_matches(&context_token)? {
                     tracing::debug!("semantic context changed during retry fetch; retrying");
                     continue;
                 }
+                let retry_finalize_start = Instant::now();
                 (available_hits, paged_hits) = finalize_hits(&retry_results)?;
+                finalize_elapsed += retry_finalize_start.elapsed();
                 ann_stats = retry_ann_stats;
+                tracing::info!(
+                    query = canonical,
+                    setup_ms = setup_elapsed.as_millis(),
+                    initial_candidate_ms = candidate_elapsed.as_millis(),
+                    retry_candidate_ms = retry_candidate_elapsed.as_millis(),
+                    finalize_ms = finalize_elapsed.as_millis(),
+                    total_ms = overall_start.elapsed().as_millis(),
+                    target_hits,
+                    available_hits,
+                    returned = paged_hits.len(),
+                    approximate,
+                    tier_mode = ?tier_mode,
+                    "semantic search stage timings"
+                );
+            } else {
+                tracing::info!(
+                    query = canonical,
+                    setup_ms = setup_elapsed.as_millis(),
+                    candidate_ms = candidate_elapsed.as_millis(),
+                    finalize_ms = finalize_elapsed.as_millis(),
+                    total_ms = overall_start.elapsed().as_millis(),
+                    target_hits,
+                    available_hits,
+                    returned = paged_hits.len(),
+                    approximate,
+                    tier_mode = ?tier_mode,
+                    "semantic search stage timings"
+                );
             }
 
             tracing::trace!(
