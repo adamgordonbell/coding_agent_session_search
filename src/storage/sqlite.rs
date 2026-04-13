@@ -10825,6 +10825,19 @@ mod tests {
     }
 
     #[test]
+    fn open_readonly_succeeds_while_writer_is_live() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("writer-live.db");
+
+        let writer = SqliteStorage::open(&db_path).unwrap();
+        assert_eq!(writer.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+
+        let readonly = SqliteStorage::open_readonly(&db_path)
+            .expect("readonly open should succeed while a writer connection is live");
+        assert!(readonly.schema_version().is_ok());
+    }
+
+    #[test]
     fn reopen_existing_current_schema_is_idempotent() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("existing.db");

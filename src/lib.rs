@@ -2883,15 +2883,7 @@ async fn execute_cli(
                 }
             }
         }
-        Commands::Index { .. }
-        | Commands::Search { .. }
-        | Commands::Stats { .. }
-        | Commands::Diag { .. }
-        | Commands::Status { .. }
-        | Commands::View { .. }
-        | Commands::Pages { .. }
-        | Commands::Import(..)
-        | Commands::Analytics(..) => {
+        cmd if uses_standard_cli_tracing(cmd) => {
             tracing_subscriber::fmt()
                 .with_env_filter(filter)
                 .with_writer(std::io::stderr)
@@ -5739,6 +5731,22 @@ fn describe_command(cli: &Cli) -> String {
     }
 }
 
+fn uses_standard_cli_tracing(command: &Commands) -> bool {
+    matches!(
+        command,
+        Commands::Index { .. }
+            | Commands::Search { .. }
+            | Commands::Stats { .. }
+            | Commands::Diag { .. }
+            | Commands::Status { .. }
+            | Commands::View { .. }
+            | Commands::Pages { .. }
+            | Commands::Import(..)
+            | Commands::Analytics(..)
+            | Commands::Daemon { .. }
+    )
+}
+
 fn resolve_subcommand_structured_format(cli: &Cli, json: bool) -> Option<RobotFormat> {
     cli.robot_format
         .or(if json { Some(RobotFormat::Json) } else { None })
@@ -6730,7 +6738,9 @@ fn run_cli_search(
     mode: Option<crate::search::query::SearchMode>,
     semantic_opts: SemanticSearchOptions,
 ) -> CliResult<()> {
-    use crate::search::model_manager::{load_hash_semantic_context, load_semantic_context};
+    use crate::search::model_manager::{
+        load_hash_semantic_context, load_semantic_assets, load_semantic_context,
+    };
     use crate::search::query::{
         QueryExplanation, SearchClient, SearchClientOptions, SearchFilters, SearchMode,
     };
@@ -6830,24 +6840,93 @@ fn run_cli_search(
         };
         let prefer_hash = embedder_info.is_some_and(|e| e.name == HASH_EMBEDDER);
 
-        let setup = if prefer_hash {
-            load_hash_semantic_context(&data_dir, &db_path)
+        if semantic_opts.use_daemon && !prefer_hash {
+            let setup = load_semantic_assets(&data_dir, &db_path);
+            if let Some(context) = setup.context {
+                let daemon_embedder: Arc<dyn crate::search::embedder::Embedder> = {
+                    #[cfg(unix)]
+                    {
+                        let daemon = crate::daemon::client::connect_or_spawn()
+                            .ok()
+                            .map(|d| d as Arc<dyn crate::search::daemon_client::DaemonClient>)
+                            .unwrap_or_else(|| {
+                                Arc::new(crate::search::daemon_client::NoopDaemonClient::new(
+                                    "daemon-unconfigured",
+                                ))
+                            });
+                        Arc::new(crate::search::daemon_embedder::DaemonMiniLmEmbedder::new(
+                            daemon,
+                        ))
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        Arc::new(crate::search::daemon_embedder::DaemonMiniLmEmbedder::new(
+                            Arc::new(crate::search::daemon_client::NoopDaemonClient::new(
+                                "daemon-unconfigured",
+                            )),
+                        ))
+                    }
+                };
+
+                let ann_path = Some(
+                    data_dir
+                        .join(crate::search::vector_index::VECTOR_INDEX_DIR)
+                        .join(format!("hnsw-{}.chsw", daemon_embedder.id())),
+                );
+                if let Err(err) = client.set_semantic_context(
+                    daemon_embedder,
+                    context.index,
+                    context.filter_maps,
+                    context.roles,
+                    ann_path,
+                ) {
+                    return Err(CliError {
+                        code: 15,
+                        kind: "semantic-unavailable",
+                        message: format!("Semantic search not available: {err}"),
+                        hint: Some(
+                            "Semantic daemon setup failed; use --mode lexical or retry without --daemon"
+                                .to_string(),
+                        ),
+                        retryable: false,
+                    });
+                }
+            } else {
+                let _ = client.clear_semantic_context();
+                return Err(CliError {
+                    code: 15,
+                    kind: "semantic-unavailable",
+                    message: format!(
+                        "Semantic search not available: {}",
+                        setup.availability.summary()
+                    ),
+                    hint: Some(
+                        "Run 'cass models install' and then 'cass index --semantic', or use --mode lexical"
+                            .to_string(),
+                    ),
+                    retryable: false,
+                });
+            }
         } else {
-            load_semantic_context(&data_dir, &db_path)
-        };
+            let setup = if prefer_hash {
+                load_hash_semantic_context(&data_dir, &db_path)
+            } else {
+                load_semantic_context(&data_dir, &db_path)
+            };
 
-        if let Some(context) = setup.context {
-            let embedder = context.embedder;
-            let index = context.index;
-            let filter_maps = context.filter_maps;
-            let roles = context.roles;
+            if let Some(context) = setup.context {
+                let embedder = context.embedder;
+                let index = context.index;
+                let filter_maps = context.filter_maps;
+                let roles = context.roles;
 
-            let embedder: Arc<dyn crate::search::embedder::Embedder> = if semantic_opts.use_daemon {
+                let embedder: Arc<dyn crate::search::embedder::Embedder> = if semantic_opts.use_daemon {
                 use crate::search::daemon_client::{DaemonFallbackEmbedder, DaemonRetryConfig};
 
                 #[cfg(unix)]
                 {
-                    let daemon = crate::daemon::client::try_connect()
+                    let daemon = crate::daemon::client::connect_or_spawn()
+                        .ok()
                         .map(|d| d as Arc<dyn crate::search::daemon_client::DaemonClient>)
                         .unwrap_or_else(|| {
                             Arc::new(crate::search::daemon_client::NoopDaemonClient::new(
@@ -6892,23 +6971,24 @@ fn run_cli_search(
                     retryable: false,
                 });
             }
-        } else {
-            let _ = client.clear_semantic_context();
-            let summary = setup.availability.summary();
-            let hint = if prefer_hash {
-                "Run 'cass index --semantic --embedder hash' to build the hash vector index, or use --mode lexical"
-                    .to_string()
             } else {
-                "Run 'cass models install' and then 'cass index --semantic', or use --mode lexical"
-                    .to_string()
-            };
-            return Err(CliError {
-                code: 15,
-                kind: "semantic-unavailable",
-                message: format!("Semantic search not available: {summary}"),
-                hint: Some(hint),
-                retryable: false,
-            });
+                let _ = client.clear_semantic_context();
+                let summary = setup.availability.summary();
+                let hint = if prefer_hash {
+                    "Run 'cass index --semantic --embedder hash' to build the hash vector index, or use --mode lexical"
+                        .to_string()
+                } else {
+                    "Run 'cass models install' and then 'cass index --semantic', or use --mode lexical"
+                        .to_string()
+                };
+                return Err(CliError {
+                    code: 15,
+                    kind: "semantic-unavailable",
+                    message: format!("Semantic search not available: {summary}"),
+                    hint: Some(hint),
+                    retryable: false,
+                });
+            }
         }
     }
 
@@ -7197,7 +7277,8 @@ fn run_cli_search(
 
             #[cfg(unix)]
             {
-                let daemon = crate::daemon::client::try_connect()
+                let daemon = crate::daemon::client::connect_or_spawn()
+                    .ok()
                     .map(|d| d as Arc<dyn crate::search::daemon_client::DaemonClient>)
                     .unwrap_or_else(|| {
                         Arc::new(crate::search::daemon_client::NoopDaemonClient::new(
@@ -7628,30 +7709,65 @@ fn expand_field_presets(fields: &Option<Vec<String>>) -> Option<Vec<String>> {
     })
 }
 
+fn default_structured_search_fields(format: RobotFormat) -> Option<Vec<String>> {
+    match format {
+        RobotFormat::Sessions => None,
+        RobotFormat::Compact => Some(vec![
+            "source_path".to_string(),
+            "line_number".to_string(),
+            "agent".to_string(),
+            "snippet".to_string(),
+        ]),
+        RobotFormat::Json | RobotFormat::Jsonl | RobotFormat::Toon => Some(vec![
+            "source_path".to_string(),
+            "line_number".to_string(),
+            "agent".to_string(),
+            "title".to_string(),
+            "score".to_string(),
+            "snippet".to_string(),
+            "source_id".to_string(),
+            "origin_kind".to_string(),
+            "origin_host".to_string(),
+        ]),
+    }
+}
+
 fn resolve_field_mask(
     fields: &Option<Vec<String>>,
     format: Option<RobotFormat>,
     display_format: Option<DisplayFormat>,
 ) -> crate::search::query::FieldMask {
     use crate::search::query::FieldMask;
+    let fields_unspecified = fields.as_ref().is_none_or(|field_list| field_list.is_empty());
 
     if matches!(format, Some(RobotFormat::Sessions)) {
         return FieldMask::new(false, false, false, false);
     }
 
-    if format.is_none() && display_format.is_none() {
-        return FieldMask::new(true, true, false, true);
+    if fields_unspecified {
+        if format.is_none() {
+            let wants_snippet = true;
+            let wants_title = matches!(
+                display_format,
+                Some(DisplayFormat::Table) | Some(DisplayFormat::Lines)
+            );
+            return FieldMask::new(false, wants_snippet, wants_title, wants_snippet);
+        }
+
+        let wants_snippet = !matches!(format, Some(RobotFormat::Compact));
+        let wants_title = matches!(format, Some(RobotFormat::Json | RobotFormat::Jsonl));
+        return FieldMask::new(false, wants_snippet, wants_title, wants_snippet);
     }
 
-    if format.is_none() {
-        return FieldMask::new(true, true, false, true);
-    }
-
-    let resolved_fields = expand_field_presets(fields);
-    let wants_all = fields.is_none()
-        || resolved_fields
-            .as_ref()
-            .is_some_and(|field_list| field_list.is_empty());
+    let fields_unspecified = fields.as_ref().is_none_or(|field_list| field_list.is_empty());
+    let resolved_fields = if fields_unspecified {
+        format.and_then(default_structured_search_fields)
+    } else {
+        expand_field_presets(fields)
+    };
+    let wants_all = resolved_fields
+        .as_ref()
+        .is_some_and(|field_list| field_list.is_empty());
     let wants_snippet = wants_all
         || resolved_fields
             .as_ref()
@@ -7666,7 +7782,7 @@ fn resolve_field_mask(
             .is_some_and(|field_list| field_list.iter().any(|f| f == "title"));
 
     let needs_content = wants_content || wants_snippet;
-    let allows_cache = needs_content;
+    let allows_cache = needs_content || wants_snippet;
     FieldMask::new(needs_content, wants_snippet, wants_title, allows_cache)
 }
 
@@ -7715,6 +7831,51 @@ fn normalized_robot_hit_for_output(
         normalized.score = 0.0;
     }
     normalized
+}
+
+#[cfg(test)]
+mod field_mask_tests {
+    use super::{
+        default_structured_search_fields, resolve_field_mask, DisplayFormat, RobotFormat,
+    };
+
+    #[test]
+    fn default_human_search_prefers_snippets_over_full_content() {
+        let mask = resolve_field_mask(&None, None, Some(DisplayFormat::Lines));
+        assert!(!mask.needs_content());
+        assert!(mask.wants_snippet());
+        assert!(mask.wants_title());
+        assert!(mask.allows_cache());
+    }
+
+    #[test]
+    fn default_robot_json_search_does_not_load_full_content() {
+        let mask = resolve_field_mask(&None, Some(RobotFormat::Json), None);
+        assert!(!mask.needs_content());
+        assert!(mask.wants_snippet());
+        assert!(mask.wants_title());
+        assert!(mask.allows_cache());
+    }
+
+    #[test]
+    fn explicit_content_field_still_requests_full_content() {
+        let mask = resolve_field_mask(
+            &Some(vec!["content".to_string()]),
+            Some(RobotFormat::Json),
+            None,
+        );
+        assert!(mask.needs_content());
+        assert!(!mask.wants_snippet());
+        assert!(!mask.wants_title());
+        assert!(mask.allows_cache());
+    }
+
+    #[test]
+    fn default_robot_fields_exclude_content() {
+        let fields = default_structured_search_fields(RobotFormat::Json).unwrap();
+        assert!(fields.iter().any(|field| field == "snippet"));
+        assert!(!fields.iter().any(|field| field == "content"));
+    }
 }
 
 fn projected_hit_field_value(
@@ -8010,13 +8171,20 @@ fn output_robot_results(
         return Ok(());
     }
 
-    // Expand presets (minimal, summary, provenance, all, *)
-    let resolved_fields = expand_field_presets(fields);
+    // Expand presets (minimal, summary, provenance, all, *).
+    // When callers omit --fields, use a lightweight default structured
+    // projection instead of materializing full content by default.
+    let fields_unspecified = fields.as_ref().is_none_or(|field_list| field_list.is_empty());
+    let resolved_fields = if fields_unspecified {
+        default_structured_search_fields(format)
+    } else {
+        expand_field_presets(fields)
+    };
 
     // Filter hits to requested fields, and only apply truncation when limits are configured.
     let all_fields_requested = resolved_fields
         .as_ref()
-        .is_none_or(|fields| fields.is_empty());
+        .is_none_or(|field_list| field_list.is_empty());
     let minimal_projection = resolved_fields.as_ref().is_some_and(|fields| {
         fields.len() == 3
             && fields[0] == "source_path"
@@ -23703,6 +23871,18 @@ mod daemon_cli_config_tests {
                 assert_eq!(config.request_timeout, Duration::from_secs(9));
             },
         );
+    }
+
+    #[test]
+    fn daemon_command_uses_standard_cli_tracing_branch() {
+        let command = Commands::Daemon {
+            socket: Some(PathBuf::from("/tmp/test.sock")),
+            idle_timeout: None,
+            max_connections: None,
+            data_dir: None,
+        };
+
+        assert!(uses_standard_cli_tracing(&command));
     }
 }
 

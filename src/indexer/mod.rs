@@ -2367,6 +2367,47 @@ pub fn run_index(
     persist::apply_index_writer_busy_timeout(&storage);
     persist::apply_index_writer_checkpoint_policy(&storage, defer_checkpoints);
     let index_path = index_dir(&opts.data_dir)?;
+    let standalone_hnsw_only = opts.build_hnsw
+        && !opts.semantic
+        && !opts.watch
+        && !opts.full
+        && !opts.force_rebuild
+        && opts
+            .watch_once_paths
+            .as_ref()
+            .is_none_or(|paths| paths.is_empty());
+
+    if standalone_hnsw_only {
+        let semantic_indexer = SemanticIndexer::new(&opts.embedder, Some(&opts.data_dir))?;
+        let vector_path = crate::search::vector_index::vector_index_path(
+            &opts.data_dir,
+            semantic_indexer.embedder_id(),
+        );
+        if !vector_path.is_file() {
+            anyhow::bail!(
+                "cannot build HNSW index: semantic vector index not found at {}",
+                vector_path.display()
+            );
+        }
+
+        tracing::info!(
+            path = %vector_path.display(),
+            embedder = semantic_indexer.embedder_id(),
+            "building standalone HNSW index from existing semantic vectors"
+        );
+        let vector_index = frankensearch::index::VectorIndex::open(&vector_path)
+            .map_err(|err| anyhow::anyhow!("open existing fsvi index failed: {err}"))?;
+        let hnsw_path =
+            semantic_indexer.build_hnsw_index(&vector_index, &opts.data_dir, None, None)?;
+        tracing::info!(
+            path = %hnsw_path.display(),
+            embedder = semantic_indexer.embedder_id(),
+            "standalone HNSW build complete"
+        );
+        reset_progress_to_idle(opts.progress.as_ref());
+        return Ok(());
+    }
+
     if let Some(paths) = opts
         .watch_once_paths
         .clone()
@@ -2826,6 +2867,8 @@ pub fn run_index(
         t_index
     };
 
+    let mut hnsw_built = false;
+
     // Semantic indexing (if enabled)
     if opts.semantic {
         // In watch mode, skip the expensive bulk re-embed if a vector index and
@@ -2932,6 +2975,7 @@ pub fn run_index(
                         embedder = semantic_indexer.embedder_id(),
                         "saved HNSW index for approximate search"
                     );
+                    hnsw_built = true;
                 }
             }
 
@@ -2948,6 +2992,33 @@ pub fn run_index(
                 )?;
             }
         }
+    }
+
+    if opts.build_hnsw && !hnsw_built {
+        let semantic_indexer = SemanticIndexer::new(&opts.embedder, Some(&opts.data_dir))?;
+        let index_path =
+            crate::search::vector_index::vector_index_path(&opts.data_dir, semantic_indexer.embedder_id());
+        if !index_path.is_file() {
+            anyhow::bail!(
+                "cannot build HNSW index: semantic vector index not found at {}",
+                index_path.display()
+            );
+        }
+
+        tracing::info!(
+            path = %index_path.display(),
+            embedder = semantic_indexer.embedder_id(),
+            "loading existing semantic vector index for HNSW build"
+        );
+        let vector_index = frankensearch::index::VectorIndex::open(&index_path)
+            .map_err(|err| anyhow::anyhow!("open existing fsvi index failed: {err}"))?;
+        let hnsw_path =
+            semantic_indexer.build_hnsw_index(&vector_index, &opts.data_dir, None, None)?;
+        tracing::info!(
+            path = %hnsw_path.display(),
+            embedder = semantic_indexer.embedder_id(),
+            "saved HNSW index for approximate search"
+        );
     }
 
     // Update last_scan_ts after successful scan and commit. Pure lexical-resume

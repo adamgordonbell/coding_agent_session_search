@@ -2718,7 +2718,7 @@ impl SearchClient {
         if guard.is_none()
             && let Some(path) = &self.sqlite_path
         {
-            match FrankenStorage::open(path) {
+            match open_search_storage(path) {
                 Ok(storage) => {
                     *guard = Some(SendConnection(storage.into_raw()));
                 }
@@ -2926,6 +2926,14 @@ impl SearchClient {
         });
 
         if unsupported_wildcards {
+            return Ok(Vec::new());
+        }
+
+        if is_broad_natural_language_query(&sanitized) {
+            tracing::debug!(
+                query = sanitized,
+                "skipping sqlite fallback for broad natural-language lexical query"
+            );
             return Ok(Vec::new());
         }
 
@@ -4553,7 +4561,12 @@ impl SearchClient {
         let has_boolean_or_phrase = fs_cass_has_boolean_operators(query);
         let is_sparse = hits.len() < sparse_threshold && offset == 0;
 
-        if !is_sparse || query_has_wildcards || has_boolean_or_phrase || query.trim().is_empty() {
+        if !is_sparse
+            || query_has_wildcards
+            || has_boolean_or_phrase
+            || query.trim().is_empty()
+            || is_broad_natural_language_query(query)
+        {
             // Either we have enough results, query already has wildcards,
             // query uses boolean/phrases, or query is empty.
             // Generate suggestions only if truly zero hits
@@ -5083,30 +5096,38 @@ impl SearchClient {
         } else {
             "''"
         };
-        let content_expr = if field_mask.needs_content() || field_mask.wants_snippet() {
+        let content_expr = if field_mask.needs_content() {
             "fts_messages.content"
         } else {
             "''"
         };
-        let normalized_source_sql = normalized_search_source_id_sql_expr("c.source_id");
+        let snippet_expr = if field_mask.wants_snippet() {
+            "snippet(fts_messages, 0, '', '', '...', 32)"
+        } else {
+            "''"
+        };
+        let conversation_id_expr = "m.conversation_id";
+        let source_id_expr = format!(
+            "(SELECT c.source_id FROM conversations c WHERE c.id = {conversation_id_expr})"
+        );
+        let normalized_source_sql = normalized_search_source_id_sql_expr(&source_id_expr);
         let created_at_expr = "CAST(fts_messages.created_at AS INTEGER)";
         let mut sql = format!(
             "SELECT {title_expr},
                     {content_expr},
+                    {snippet_expr},
                     fts_messages.agent,
                     COALESCE(fts_messages.workspace, ''),
                     fts_messages.source_path,
                     {created_at_expr},
                     m.idx,
-                    c.id,
+                    {conversation_id_expr},
                     {normalized_source_sql},
-                    c.origin_host,
-                    COALESCE(s.kind, 'local'),
+                    (SELECT c.origin_host FROM conversations c WHERE c.id = {conversation_id_expr}),
+                    '',
                     bm25(fts_messages)
              FROM fts_messages
              LEFT JOIN messages m ON {message_join}
-             LEFT JOIN conversations c ON m.conversation_id = c.id
-             LEFT JOIN sources s ON c.source_id = s.id
              WHERE fts_messages MATCH ?"
         );
         let mut params = Vec::with_capacity(filters.agents.len() + filters.workspaces.len() + 5);
@@ -5165,18 +5186,19 @@ impl SearchClient {
         for row in rows {
             let title: String = row.get_typed(0)?;
             let raw_content: String = row.get_typed(1)?;
-            let agent: String = row.get_typed(2)?;
-            let workspace: String = row.get_typed(3)?;
-            let source_path: String = row.get_typed(4)?;
-            let created_at: Option<i64> = row.get_typed(5)?;
-            let idx: Option<i64> = row.get_typed(6)?;
-            let conversation_id: Option<i64> = row.get_typed(7)?;
+            let raw_snippet: String = row.get_typed(2)?;
+            let agent: String = row.get_typed(3)?;
+            let workspace: String = row.get_typed(4)?;
+            let source_path: String = row.get_typed(5)?;
+            let created_at: Option<i64> = row.get_typed(6)?;
+            let idx: Option<i64> = row.get_typed(7)?;
+            let conversation_id: Option<i64> = row.get_typed(8)?;
             let raw_source_id: String = row
-                .get_typed::<Option<String>>(8)?
+                .get_typed::<Option<String>>(9)?
                 .unwrap_or_else(default_source_id);
-            let origin_host: Option<String> = row.get_typed(9)?;
-            let raw_origin_kind: Option<String> = row.get_typed(10)?;
-            let bm25_score = match row.get_typed::<Option<f64>>(11)? {
+            let origin_host: Option<String> = row.get_typed(10)?;
+            let raw_origin_kind: Option<String> = row.get_typed(11)?;
+            let bm25_score = match row.get_typed::<Option<f64>>(12)? {
                 Some(score) => score,
                 None => continue,
             };
@@ -5193,7 +5215,11 @@ impl SearchClient {
                 .and_then(|i| usize::try_from(i).ok())
                 .map(|i| i.saturating_add(1));
             let snippet = if field_mask.wants_snippet() {
-                snippet_from_content(&raw_content)
+                if !field_mask.needs_content() && !raw_snippet.is_empty() {
+                    raw_snippet
+                } else {
+                    snippet_from_content(&raw_content)
+                }
             } else {
                 String::new()
             };
@@ -5404,6 +5430,44 @@ impl SearchClient {
     }
 }
 
+fn open_search_storage(path: &Path) -> Result<FrankenStorage> {
+    if path.exists()
+        && current_schema_fast_probe(path).unwrap_or(false)
+        && let Ok(storage) = FrankenStorage::open_writer(path)
+    {
+        tracing::debug!(
+            path = %path.display(),
+            "search opened current-schema sqlite via writer fast path"
+        );
+        return Ok(storage);
+    }
+
+    FrankenStorage::open(path)
+}
+
+fn current_schema_fast_probe(db_path: &Path) -> Result<bool> {
+    let mut conn = Connection::open(db_path.to_string_lossy().to_string())
+        .with_context(|| format!("opening frankensqlite db at {}", db_path.display()))?;
+
+    let version = conn
+        .query("SELECT value FROM meta WHERE key = 'schema_version';")
+        .ok()
+        .and_then(|rows| rows.first().cloned())
+        .and_then(|row| row.get_typed::<String>(0).ok())
+        .and_then(|raw| raw.parse::<i64>().ok());
+
+    if let Err(close_err) = conn.close_in_place() {
+        tracing::warn!(
+            error = %close_err,
+            db_path = %db_path.display(),
+            "search current_schema_fast_probe: close_in_place failed; falling back to best-effort close"
+        );
+        conn.close_best_effort_in_place();
+    }
+
+    Ok(version == Some(crate::storage::sqlite::CURRENT_SCHEMA_VERSION))
+}
+
 /// Transpile a raw query string into an FTS5-compatible query string.
 /// Preserves custom precedence (OR > AND) by adding parentheses.
 /// Returns None if the query contains features unsupported by FTS5 (e.g. leading wildcards).
@@ -5574,6 +5638,42 @@ fn transpile_to_fts5(raw_query: &str) -> Option<String> {
     }
 
     Some(query)
+}
+
+fn is_broad_natural_language_query(raw_query: &str) -> bool {
+    if fs_cass_has_boolean_operators(raw_query)
+        || raw_query.contains('"')
+        || raw_query.contains('*')
+    {
+        return false;
+    }
+
+    let tokens: Vec<&str> = raw_query
+        .split_whitespace()
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .collect();
+    if tokens.len() < 7 {
+        return false;
+    }
+
+    let identifier_like = tokens
+        .iter()
+        .filter(|token| {
+            token
+                .chars()
+                .any(|ch| ch.is_ascii_digit() || matches!(ch, '-' | '_' | '.' | '/' | '\\'))
+        })
+        .count();
+    if identifier_like > 1 {
+        return false;
+    }
+
+    let alpha_tokens = tokens
+        .iter()
+        .filter(|token| token.chars().all(|ch| ch.is_ascii_alphabetic()))
+        .count();
+    alpha_tokens >= tokens.len().saturating_sub(1)
 }
 
 #[derive(Default, Clone)]
@@ -6940,6 +7040,15 @@ mod tests {
         Ok(conn.query_row_map(
             "SELECT COUNT(*) FROM sqlite_master WHERE name = ?1",
             &[ParamValue::from(name)],
+            |row| row.get_typed(0),
+        )?)
+    }
+
+    fn sqlite_generation_key_count(db_path: &Path, key: &str) -> Result<i64> {
+        let conn = FrankenConnection::open(db_path.to_string_lossy().as_ref())?;
+        Ok(conn.query_row_map(
+            "SELECT COUNT(*) FROM meta WHERE key = ?1",
+            &[ParamValue::from(key)],
             |row| row.get_typed(0),
         )?)
     }
@@ -8443,7 +8552,8 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_guard_rebuilds_fts_when_generation_key_stale() -> Result<()> {
+    fn sqlite_guard_current_schema_fast_path_skips_fts_rebuild_when_generation_key_stale()
+    -> Result<()> {
         let temp_dir = TempDir::new()?;
         let db_path = temp_dir.path().join("stale-gen-fts.db");
 
@@ -8504,9 +8614,15 @@ mod tests {
             )?;
         }
 
-        // Opening via sqlite_guard() triggers FrankenStorage::open() →
-        // ensure_fts_consistency_via_frankensqlite() which detects the
-        // missing generation key and rebuilds FTS.
+        let rebuild_marker_before =
+            sqlite_generation_key_count(&db_path, "fts_frankensqlite_rebuild_generation")?;
+        assert_eq!(
+            rebuild_marker_before, 0,
+            "fixture should start without the rebuild generation marker"
+        );
+
+        // Opening via sqlite_guard() should now use the current-schema writer
+        // fast path and avoid the expensive FTS repair pass.
         let client = SearchClient {
             reader: None,
             sqlite: Mutex::new(None),
@@ -8528,14 +8644,30 @@ mod tests {
             .sqlite_guard()
             .context("open sqlite guard for stale generation fixture")?;
         assert!(guard.is_some(), "sqlite guard should open the db");
+        let conn = guard
+            .as_ref()
+            .expect("sqlite guard should hold a connection");
+        let rows = conn.query("SELECT rowid FROM fts_messages")?;
+        assert_eq!(
+            rows.len(),
+            1,
+            "sqlite guard should preserve existing FTS rows"
+        );
         drop(guard);
 
-        // After rebuild: exactly 1 schema entry and FTS is queryable.
+        // After reopen: exactly 1 schema entry and no rebuild marker was
+        // reintroduced, proving search avoided the repair path.
         let count_after = sqlite_master_name_count(&db_path, "fts_messages")
             .context("count schema rows after sqlite guard reopen")?;
         assert_eq!(
             count_after, 1,
             "reopen must leave exactly one fts_messages schema entry"
+        );
+        let rebuild_marker_after =
+            sqlite_generation_key_count(&db_path, "fts_frankensqlite_rebuild_generation")?;
+        assert_eq!(
+            rebuild_marker_after, 0,
+            "search fast path should not recreate the FTS rebuild generation marker"
         );
 
         Ok(())
@@ -16087,6 +16219,15 @@ mod tests {
 
         // Leading unary-NOT forms are not valid FTS5 queries.
         assert_eq!(transpile_to_fts5("NOT A OR B"), None);
+    }
+
+    #[test]
+    fn broad_natural_language_query_detector_flags_verbose_paraphrases() {
+        assert!(is_broad_natural_language_query(
+            "conversation where sqlite repair path blew up memory during indexing"
+        ));
+        assert!(!is_broad_natural_language_query("frankensqlite out of memory"));
+        assert!(!is_broad_natural_language_query("br-123 jsonl indexing failure"));
     }
 
     #[test]

@@ -13,6 +13,8 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use anyhow::Result;
+
 use crate::search::embedder::Embedder;
 use crate::search::fastembed_embedder::FastEmbedder;
 use crate::search::hash_embedder::HashEmbedder;
@@ -275,12 +277,27 @@ pub struct SemanticSetup {
     pub context: Option<SemanticContext>,
 }
 
+pub struct SemanticAssetsContext {
+    pub index: VectorIndex,
+    pub filter_maps: SemanticFilterMaps,
+    pub roles: Option<HashSet<u8>>,
+}
+
+pub struct SemanticAssetsSetup {
+    pub availability: SemanticAvailability,
+    pub context: Option<SemanticAssetsContext>,
+}
+
 /// Load semantic context with optional version mismatch checking.
 ///
 /// If `check_for_updates` is true, this function will check if the installed
 /// model version matches the manifest and return `UpdateAvailable` if they differ.
 pub fn load_semantic_context(data_dir: &Path, db_path: &Path) -> SemanticSetup {
     load_semantic_context_inner(data_dir, db_path, true)
+}
+
+pub fn load_semantic_assets(data_dir: &Path, db_path: &Path) -> SemanticAssetsSetup {
+    load_semantic_assets_inner(data_dir, db_path, true)
 }
 
 /// Load hash-based semantic context (no model download required).
@@ -294,13 +311,13 @@ pub fn load_hash_semantic_context(data_dir: &Path, db_path: &Path) -> SemanticSe
         };
     }
 
-    let storage = match FrankenStorage::open_readonly(db_path) {
+    let storage = match open_semantic_storage(db_path) {
         Ok(storage) => storage,
         Err(err) => {
             return SemanticSetup {
                 availability: SemanticAvailability::DatabaseUnavailable {
                     db_path: db_path.to_path_buf(),
-                    error: err.to_string(),
+                    error: err,
                 },
                 context: None,
             };
@@ -353,6 +370,10 @@ pub fn load_semantic_context_no_version_check(data_dir: &Path, db_path: &Path) -
     load_semantic_context_inner(data_dir, db_path, false)
 }
 
+pub fn load_semantic_assets_no_version_check(data_dir: &Path, db_path: &Path) -> SemanticAssetsSetup {
+    load_semantic_assets_inner(data_dir, db_path, false)
+}
+
 fn load_semantic_context_inner(
     data_dir: &Path,
     db_path: &Path,
@@ -402,13 +423,13 @@ fn load_semantic_context_inner(
         };
     }
 
-    let storage = match FrankenStorage::open_readonly(db_path) {
+    let storage = match open_semantic_storage(db_path) {
         Ok(storage) => storage,
         Err(err) => {
             return SemanticSetup {
                 availability: SemanticAvailability::DatabaseUnavailable {
                     db_path: db_path.to_path_buf(),
-                    error: err.to_string(),
+                    error: err,
                 },
                 context: None,
             };
@@ -463,6 +484,146 @@ fn load_semantic_context_inner(
             filter_maps,
             roles,
         }),
+    }
+}
+
+fn load_semantic_assets_inner(
+    data_dir: &Path,
+    db_path: &Path,
+    check_for_updates: bool,
+) -> SemanticAssetsSetup {
+    let model_dir = FastEmbedder::default_model_dir(data_dir);
+    let missing_files = FastEmbedder::required_model_files()
+        .iter()
+        .filter(|name| !model_dir.join(*name).is_file())
+        .map(|name| (*name).to_string())
+        .collect::<Vec<_>>();
+
+    if !missing_files.is_empty() {
+        return SemanticAssetsSetup {
+            availability: SemanticAvailability::ModelMissing {
+                model_dir,
+                missing_files,
+            },
+            context: None,
+        };
+    }
+
+    if check_for_updates {
+        let manifest = ModelManifest::minilm_v2();
+        if let Some(ModelState::UpdateAvailable {
+            current_revision,
+            latest_revision,
+        }) = check_version_mismatch(&model_dir, &manifest)
+        {
+            return SemanticAssetsSetup {
+                availability: SemanticAvailability::UpdateAvailable {
+                    embedder_id: FastEmbedder::embedder_id_static().to_string(),
+                    current_revision,
+                    latest_revision,
+                },
+                context: None,
+            };
+        }
+    }
+
+    let index_path = vector_index_path(data_dir, FastEmbedder::embedder_id_static());
+    if !index_path.is_file() {
+        return SemanticAssetsSetup {
+            availability: SemanticAvailability::IndexMissing { index_path },
+            context: None,
+        };
+    }
+
+    let storage = match open_semantic_storage(db_path) {
+        Ok(storage) => storage,
+        Err(err) => {
+            return SemanticAssetsSetup {
+                availability: SemanticAvailability::DatabaseUnavailable {
+                    db_path: db_path.to_path_buf(),
+                    error: err,
+                },
+                context: None,
+            };
+        }
+    };
+
+    let filter_maps = match SemanticFilterMaps::from_storage(&storage) {
+        Ok(maps) => maps,
+        Err(err) => {
+            return SemanticAssetsSetup {
+                availability: SemanticAvailability::LoadFailed {
+                    context: format!("filter maps: {err}"),
+                },
+                context: None,
+            };
+        }
+    };
+
+    let index = match VectorIndex::open(&index_path) {
+        Ok(index) => index,
+        Err(err) => {
+            return SemanticAssetsSetup {
+                availability: SemanticAvailability::LoadFailed {
+                    context: format!("vector index: {err}"),
+                },
+                context: None,
+            };
+        }
+    };
+
+    let roles = Some(HashSet::from([ROLE_USER, ROLE_ASSISTANT]));
+
+    SemanticAssetsSetup {
+        availability: SemanticAvailability::Ready {
+            embedder_id: FastEmbedder::embedder_id_static().to_string(),
+        },
+        context: Some(SemanticAssetsContext {
+            index,
+            filter_maps,
+            roles,
+        }),
+    }
+}
+
+fn open_semantic_storage(db_path: &Path) -> std::result::Result<FrankenStorage, String> {
+    open_semantic_storage_with(
+        db_path,
+        FrankenStorage::open_readonly,
+        FrankenStorage::open_writer,
+    )
+}
+
+fn open_semantic_storage_with<OpenReadonly, OpenWriter>(
+    db_path: &Path,
+    open_readonly: OpenReadonly,
+    open_writer: OpenWriter,
+) -> std::result::Result<FrankenStorage, String>
+where
+    OpenReadonly: Fn(&Path) -> Result<FrankenStorage>,
+    OpenWriter: Fn(&Path) -> Result<FrankenStorage>,
+{
+    match open_readonly(db_path) {
+        Ok(storage) => Ok(storage),
+        Err(readonly_err) => {
+            tracing::warn!(
+                db_path = %db_path.display(),
+                error = %readonly_err,
+                "semantic search readonly storage open failed; retrying with writer fast path"
+            );
+            match open_writer(db_path) {
+                Ok(storage) => {
+                    tracing::info!(
+                        db_path = %db_path.display(),
+                        "semantic search opened storage via writer fast path after readonly failure"
+                    );
+                    Ok(storage)
+                }
+                Err(writer_err) => Err(format!(
+                    "readonly open failed: {readonly_err}; writer fallback failed: {writer_err}"
+                )),
+            }
+        }
     }
 }
 
@@ -530,6 +691,8 @@ pub fn default_model_manifest() -> ModelManifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::sqlite::SqliteStorage;
+    use anyhow::anyhow;
     use tempfile::tempdir;
 
     #[test]
@@ -649,5 +812,38 @@ mod tests {
         let result = delete_vector_index_for_rebuild(tmp.path());
         assert!(result.is_ok());
         assert!(!result.unwrap());
+    }
+
+    #[test]
+    fn test_open_semantic_storage_falls_back_to_writer() {
+        let tmp = tempdir().unwrap();
+        let db_path = tmp.path().join("semantic.db");
+        let seed = SqliteStorage::open(&db_path).expect("seed db");
+        drop(seed);
+
+        let storage = open_semantic_storage_with(
+            &db_path,
+            |_| Err(anyhow!("simulated readonly failure")),
+            FrankenStorage::open_writer,
+        )
+        .expect("writer fallback should succeed");
+
+        assert!(storage.schema_version().is_ok());
+    }
+
+    #[test]
+    fn test_open_semantic_storage_reports_both_failures() {
+        let tmp = tempdir().unwrap();
+        let db_path = tmp.path().join("semantic.db");
+        let result = open_semantic_storage_with(
+            &db_path,
+            |_| Err(anyhow!("readonly failed")),
+            |_| Err(anyhow!("writer failed")),
+        );
+        assert!(result.is_err(), "both opens should fail");
+        let err = result.err().unwrap_or_default();
+
+        assert!(err.contains("readonly failed"));
+        assert!(err.contains("writer failed"));
     }
 }

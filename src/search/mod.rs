@@ -24,6 +24,7 @@ pub mod ann_index;
 pub mod asset_state;
 pub mod canonicalize;
 pub mod daemon_client;
+pub mod daemon_embedder;
 pub mod embedder;
 pub mod embedder_registry;
 pub mod fastembed_embedder;
